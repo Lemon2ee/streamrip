@@ -2,6 +2,7 @@ import asyncio
 import base64
 import functools
 import hashlib
+import http.client
 import itertools
 import json
 import logging
@@ -26,6 +27,10 @@ from .. import converter
 from ..exceptions import NonStreamableError
 
 logger = logging.getLogger("streamrip")
+
+# Akamai can repeat its x-ak-grn / x-ak-fwd-error headers dozens of times on
+# Qobuz streams, exceeding http.client's limit of 100 headers (#951, #1022).
+http.client._MAXHEADERS = 1000
 
 
 BLOWFISH_SECRET = "g4el58wc0zvf9na1"
