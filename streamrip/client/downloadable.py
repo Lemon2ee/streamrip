@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -38,28 +39,40 @@ def generate_temp_path(url: str):
 
 
 async def fast_async_download(path, url, headers, callback):
-    """Synchronous download with yield for every 1MB read.
+    """Download with a blocking `requests` stream on a worker thread.
 
     Using aiofiles/aiohttp resulted in a yield to the event loop for every 1KB,
-    which made file downloads CPU-bound. This resulted in a ~10MB max total download
-    speed. This fixes the issue by only yielding to the event loop for every 1MB read.
+    which made file downloads CPU-bound. Reading on the event loop thread instead
+    blocks it: concurrent downloads take turns, unread data piles up on the
+    waiting connections, and a single stalled read freezes every download.
+    Each download gets its own thread so every connection is drained continuously.
     """
     chunk_size: int = 2**17  # 131 KB
-    counter = 0
-    yield_every = 8  # 1 MB
-    with open(path, "wb") as file:  # noqa: ASYNC101
-        with requests.get(  # noqa: ASYNC100
-            url,
-            headers=headers,
-            allow_redirects=True,
-            stream=True,
-        ) as resp:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                file.write(chunk)
-                callback(len(chunk))
-                if counter % yield_every == 0:
-                    await asyncio.sleep(0)
-                counter += 1
+    loop = asyncio.get_running_loop()
+    cancelled = threading.Event()
+
+    def _download():
+        with open(path, "wb") as file:
+            with requests.get(
+                url,
+                headers=headers,
+                allow_redirects=True,
+                stream=True,
+                # (connect, read) timeout: a stalled connection raises instead of
+                # hanging forever, so the caller's retry logic can run.
+                timeout=(15, 30),
+            ) as resp:
+                for chunk in resp.iter_content(chunk_size=chunk_size):
+                    if cancelled.is_set():
+                        return
+                    file.write(chunk)
+                    loop.call_soon_threadsafe(callback, len(chunk))
+
+    try:
+        await asyncio.to_thread(_download)
+    except asyncio.CancelledError:
+        cancelled.set()
+        raise
 
 
 @dataclass(slots=True)
